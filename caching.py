@@ -51,13 +51,14 @@ class CachingMiddleware(object):
             if self.is_object_in_cache():
                 resp = self.get_cached_object()
                 return resp(env, start_response)
+
         elif self.req.method == 'POST':
             if self.is_object_prefetch:
                 resp = self.prefetch_object()
                 return resp(env, start_response)
-        else:
-            # Pass on to downstream WSGI component
-            return self.app(env, start_response)
+
+        # Pass on to downstream WSGI component
+        return self.app(env, start_response)
 
 
 class CachingMiddlewareDisk(CachingMiddleware):
