@@ -3,17 +3,20 @@ A filter that allows a caching system in the Proxy Server.
 
 @author: josep sampe
 '''
+from swift.common.utils import get_logger
+from swift.common.utils import register_swift_info
+from swift.common.utils import cache_from_env
+from swift.common.exceptions import DiskFileXattrNotSupported
+from swift.common.exceptions import DiskFileNoSpace
+from swift.common.exceptions import DiskFileNotExist
+from swift.common.swob import Request, Response
 import xattr
 import logging
 import pickle
 import errno
 import os
-from swift.common.utils import get_logger
-from swift.common.utils import register_swift_info
-from swift.common.exceptions import DiskFileXattrNotSupported
-from swift.common.exceptions import DiskFileNoSpace
-from swift.common.exceptions import DiskFileNotExist
-from swift.common.swob import Request, Response
+import redis
+
 
 SWIFT_METADATA_KEY = 'user.swift.metadata'
 PICKLE_PROTOCOL = 2
@@ -195,7 +198,7 @@ class CachingMiddlewareDisk(CachingMiddleware):
                                 request=self.req)
             else:
                 return Response(body='An error was occurred prefetching: ' +
-                                self.req.path+'\n', request=self.request)
+                                self.req.path+'\n', request=self.req)
 
         elif self.req.headers['X-Object-Prefetch'] == 'False':
             if os.path.isfile(obj_path):
@@ -208,6 +211,11 @@ class CachingMiddlewareMemcache(CachingMiddleware):
 
     def __init__(self, app, conf):
         super(CachingMiddlewareMemcache, self).__init__(app, conf)
+        self.memcache = None
+
+    def link_memcache(self):
+        if not self.memcache:
+            self.memcache = cache_from_env(self.req.environ)
 
     def is_object_in_cache(self):
         """
@@ -215,6 +223,7 @@ class CachingMiddlewareMemcache(CachingMiddleware):
         in self.cached_object.
         :return: True/False
         """
+        self.link_memcache()
         self.logger.info('Checking in cache: ' + self.req.path)
         self.cached_object = self.memcache.get(self.req.path)
 
@@ -232,13 +241,14 @@ class CachingMiddlewareMemcache(CachingMiddleware):
 
         response = Response(body=cached_obj["Body"],
                             headers=resp_headers,
-                            request=self.request)
+                            request=self.req)
         return response
 
     def prefetch_object(self):
+        self.link_memcache()
         if self.req.headers['X-Object-Prefetch'] == 'True':
             self.logger.info('Putting into cache '+self.req.path)
-            new_req = self.request.copy_get()
+            new_req = self.req.copy_get()
             new_req.headers['function-enabled'] = False
             response = new_req.get_response(self.app)
 
@@ -249,22 +259,86 @@ class CachingMiddlewareMemcache(CachingMiddleware):
             if response.is_success:
                 self.memcache.set(self.req.path, pickle.dumps(cached_obj))
                 return Response(body='Prefetched: '+self.req.path+'\n',
-                                request=self.request)
+                                request=self.req)
             else:
                 return Response(body='An error was occurred prefetcheing: ' +
-                                self.req.path+'\n', request=self.request)
+                                self.req.path+'\n', request=self.req)
 
         elif self.req.headers['X-Object-Prefetch'] == 'False':
             self.memcache.delete(self.req.path)
             return Response(body='Deleting '+self.req.path+' from cache\n',
-                            request=self.request)
+                            request=self.req)
+
+
+class CachingMiddlewareRedis(CachingMiddleware):
+
+    def __init__(self, app, conf):
+        super(CachingMiddlewareRedis, self).__init__(app, conf)
+
+        self.redis_host = conf.get('redis_host', 'controller')
+        self.redis_port = conf.get('redis_port', 6379)
+        self.redis_db = conf.get('redis_db', 1)
+        self.redis = redis.StrictRedis(self.redis_host,
+                                       self.redis_port,
+                                       self.redis_db)
+
+    def is_object_in_cache(self):
+        """
+        Checks if the requested object is in redis
+        :return: True/False
+        """
+        self.logger.info('Checking in cache: ' + self.req.path)
+
+        self.cached_object = self.redis.hgetall(self.req.path)
+
+        if self.cached_object:
+            return True
+        else:
+            return False
+
+    def get_cached_object(self):
+        """
+        Gets the object from redis.
+        :return: Response object
+        """
+        self.logger.info('Object %s in cache', self.req.path)
+        resp_headers = eval(self.cached_object["Headers"])
+
+        response = Response(body=self.cached_object["Body"],
+                            headers=resp_headers,
+                            request=self.req)
+        return response
+
+    def prefetch_object(self):
+        if self.req.headers['X-Object-Prefetch'] == 'True':
+            self.logger.info('Putting into cache '+self.req.path)
+            new_req = self.req.copy_get()
+            new_req.headers['function-enabled'] = False
+            response = new_req.get_response(self.app)
+
+            cached_obj = {}
+            cached_obj['Body'] = response.body
+            cached_obj["Headers"] = response.headers
+
+            if response.is_success:
+                self.redis.hmset(self.req.path, cached_obj)
+                return Response(body='Prefetched: '+self.req.path+'\n',
+                                request=self.req)
+            else:
+                return Response(body='An error was occurred prefetcheing: ' +
+                                self.req.path+'\n', request=self.req)
+
+        elif self.req.headers['X-Object-Prefetch'] == 'False':
+            self.redis.delete(self.req.path)
+            return Response(body='Deleting '+self.req.path+' from cache\n',
+                            request=self.req)
 
 
 def filter_factory(global_conf, **local_conf):
     conf = global_conf.copy()
     conf.update(local_conf)
 
-    conf['type'] = local_conf.get('type', 'disk')
+    conf['type'] = local_conf.get('type', 'redis')
     conf['location'] = local_conf.get('location', '/mnt/data/swift_cache')
 
     def caching_filter(app):
@@ -272,4 +346,6 @@ def filter_factory(global_conf, **local_conf):
             return CachingMiddlewareDisk(app, conf)
         if conf['type'] == 'memcache':
             return CachingMiddlewareMemcache(app, conf)
+        if conf['type'] == 'redis':
+            return CachingMiddlewareRedis(app, conf)
     return caching_filter
